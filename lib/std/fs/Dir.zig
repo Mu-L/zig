@@ -1,4 +1,6 @@
-fd: posix.fd_t,
+fd: Handle,
+
+pub const Handle = posix.fd_t;
 
 pub const default_mode = 0o755;
 
@@ -334,7 +336,6 @@ pub const Iterator = switch (native_os) {
         first_iter: bool,
 
         const Self = @This();
-        const linux = std.os.linux;
 
         pub const Error = IteratorError;
 
@@ -1789,6 +1790,9 @@ pub fn symLink(
         // when converting to an NT namespaced path. CreateSymbolicLink in
         // symLinkW will handle the necessary conversion.
         var target_path_w: windows.PathSpace = undefined;
+        if (try std.unicode.checkWtf8ToWtf16LeOverflow(target_path, &target_path_w.data)) {
+            return error.NameTooLong;
+        }
         target_path_w.len = try std.unicode.wtf8ToWtf16Le(&target_path_w.data, target_path);
         target_path_w.data[target_path_w.len] = 0;
         // However, we need to canonicalize any path separators to `\`, since if
@@ -2687,8 +2691,33 @@ pub fn statFile(self: Dir, sub_path: []const u8) StatFileError!Stat {
         const st = try std.os.fstatat_wasi(self.fd, sub_path, .{ .SYMLINK_FOLLOW = true });
         return Stat.fromWasi(st);
     }
+    if (native_os == .linux) {
+        const sub_path_c = try posix.toPosixPath(sub_path);
+        var stx = std.mem.zeroes(linux.Statx);
+
+        const rc = linux.statx(
+            self.fd,
+            &sub_path_c,
+            linux.AT.NO_AUTOMOUNT,
+            linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME,
+            &stx,
+        );
+
+        return switch (linux.E.init(rc)) {
+            .SUCCESS => Stat.fromLinux(stx),
+            .ACCES => error.AccessDenied,
+            .BADF => unreachable,
+            .FAULT => unreachable,
+            .INVAL => unreachable,
+            .LOOP => error.SymLinkLoop,
+            .NAMETOOLONG => unreachable, // Handled by posix.toPosixPath() above.
+            .NOENT, .NOTDIR => error.FileNotFound,
+            .NOMEM => error.SystemResources,
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
     const st = try posix.fstatat(self.fd, sub_path, 0);
-    return Stat.fromSystem(st);
+    return Stat.fromPosix(st);
 }
 
 pub const ChmodError = File.ChmodError;
@@ -2748,6 +2777,7 @@ const path = fs.path;
 const fs = std.fs;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
+const linux = std.os.linux;
 const windows = std.os.windows;
 const native_os = builtin.os.tag;
 const have_flock = @TypeOf(posix.system.flock) != void;
