@@ -1163,7 +1163,7 @@ const Local = struct {
                 capacity: u32,
             };
             fn header(list: ListSelf) *Header {
-                return @ptrFromInt(@intFromPtr(list.bytes) - bytes_offset);
+                return @alignCast(@ptrCast(list.bytes - bytes_offset));
             }
             pub fn view(list: ListSelf) View {
                 const capacity = list.header().capacity;
@@ -1372,7 +1372,7 @@ const Shard = struct {
                 }
             };
             fn header(map: @This()) *Header {
-                return @ptrFromInt(@intFromPtr(map.entries) - entries_offset);
+                return @alignCast(@ptrCast(@as([*]u8, @ptrCast(map.entries)) - entries_offset));
             }
 
             const Entry = extern struct {
@@ -1459,16 +1459,6 @@ pub const MapIndex = enum(u32) {
             .tid = @enumFromInt(@intFromEnum(map_index) >> ip.tid_shift_32 & ip.getTidMask()),
             .index = @intFromEnum(map_index) & ip.getIndexMask(u32),
         };
-    }
-};
-
-pub const RuntimeIndex = enum(u32) {
-    zero = 0,
-    comptime_field_ptr = std.math.maxInt(u32),
-    _,
-
-    pub fn increment(ri: *RuntimeIndex) void {
-        ri.* = @enumFromInt(@intFromEnum(ri.*) + 1);
     }
 };
 
@@ -1971,9 +1961,6 @@ pub const Key = union(enum) {
         is_var_args: bool,
         is_generic: bool,
         is_noinline: bool,
-        cc_is_generic: bool,
-        section_is_generic: bool,
-        addrspace_is_generic: bool,
 
         pub fn paramIsComptime(self: @This(), i: u5) bool {
             assert(i < self.param_types.len);
@@ -4704,9 +4691,45 @@ pub const Index = enum(u32) {
     }
 
     comptime {
-        if (builtin.zig_backend == .stage2_llvm and !builtin.strip_debug_info) {
-            _ = &dbHelper;
-        }
+        if (!builtin.strip_debug_info) switch (builtin.zig_backend) {
+            .stage2_llvm => _ = &dbHelper,
+            .stage2_x86_64 => {
+                for (@typeInfo(Tag).@"enum".fields) |tag| {
+                    if (!@hasField(@TypeOf(Tag.encodings), tag.name)) {
+                        if (false) @compileLog("missing: " ++ @typeName(Tag) ++ ".encodings." ++ tag.name);
+                        continue;
+                    }
+                    const encoding = @field(Tag.encodings, tag.name);
+                    for (@typeInfo(encoding.trailing).@"struct".fields) |field| {
+                        struct {
+                            fn checkConfig(name: []const u8) void {
+                                if (!@hasField(@TypeOf(encoding.config), name)) @compileError("missing field: " ++ @typeName(Tag) ++ ".encodings." ++ tag.name ++ ".config.@\"" ++ name ++ "\"");
+                                const FieldType = @TypeOf(@field(encoding.config, name));
+                                if (@typeInfo(FieldType) != .enum_literal) @compileError("expected enum literal: " ++ @typeName(Tag) ++ ".encodings." ++ tag.name ++ ".config.@\"" ++ name ++ "\": " ++ @typeName(FieldType));
+                            }
+                            fn checkField(name: []const u8, Type: type) void {
+                                switch (@typeInfo(Type)) {
+                                    .int => {},
+                                    .@"enum" => {},
+                                    .@"struct" => |info| assert(info.layout == .@"packed"),
+                                    .optional => |info| {
+                                        checkConfig(name ++ ".?");
+                                        checkField(name ++ ".?", info.child);
+                                    },
+                                    .pointer => |info| {
+                                        assert(info.size == .Slice);
+                                        checkConfig(name ++ ".len");
+                                        checkField(name ++ "[0]", info.child);
+                                    },
+                                    else => @compileError("unsupported type: " ++ @typeName(Tag) ++ ".encodings." ++ tag.name ++ "." ++ name ++ ": " ++ @typeName(Type)),
+                                }
+                            }
+                        }.checkField("trailing." ++ field.name, field.type);
+                    }
+                }
+            },
+            else => {},
+        };
     }
 };
 
@@ -5302,6 +5325,39 @@ pub const Tag = enum(u8) {
         };
     }
 
+    const encodings = .{
+        .type_struct = .{
+            .payload = TypeStruct,
+            .trailing = struct {
+                captures_len: ?u32,
+                captures: ?[]CaptureValue,
+                type_hash: ?u64,
+                field_types: []Index,
+                field_inits: ?[]Index,
+                field_aligns: ?[]Alignment,
+                field_is_comptime_bits: ?[]u32,
+                field_index: ?[]LoadedStructType.RuntimeOrder,
+                field_offset: []u32,
+            },
+            .config = .{
+                .@"trailing.captures_len.?" = .@"payload.flags.any_captures",
+                .@"trailing.captures.?" = .@"payload.flags.any_captures",
+                .@"trailing.captures.?.len" = .@"trailing.captures_len",
+                .@"trailing.type_hash.?" = .@"payload.flags.is_reified",
+                .@"trailing.field_types.len" = .@"payload.fields_len",
+                .@"trailing.field_inits.?" = .@"payload.flags.any_default_inits",
+                .@"trailing.field_inits.?.len" = .@"payload.fields_len",
+                .@"trailing.field_aligns.?" = .@"payload.flags.any_aligned_fields",
+                .@"trailing.field_aligns.?.len" = .@"payload.fields_len",
+                .@"trailing.field_is_comptime_bits.?" = .@"payload.flags.any_comptime_fields",
+                .@"trailing.field_is_comptime_bits.?.len" = .@"(payload.fields_len + 31) / 32",
+                .@"trailing.field_index.?" = .@"!payload.flags.is_extern",
+                .@"trailing.field_index.?.len" = .@"payload.fields_len",
+                .@"trailing.field_offset.len" = .@"payload.fields_len",
+            },
+        },
+    };
+
     pub const Variable = struct {
         ty: Index,
         /// May be `none`.
@@ -5397,10 +5453,7 @@ pub const Tag = enum(u8) {
             has_comptime_bits: bool,
             has_noalias_bits: bool,
             is_noinline: bool,
-            cc_is_generic: bool,
-            section_is_generic: bool,
-            addrspace_is_generic: bool,
-            _: u6 = 0,
+            _: u9 = 0,
         };
     };
 
@@ -6826,9 +6879,6 @@ fn extraFuncType(tid: Zcu.PerThread.Id, extra: Local.Extra, extra_index: u32) Ke
         .cc = type_function.data.flags.cc.unpack(),
         .is_var_args = type_function.data.flags.is_var_args,
         .is_noinline = type_function.data.flags.is_noinline,
-        .cc_is_generic = type_function.data.flags.cc_is_generic,
-        .section_is_generic = type_function.data.flags.section_is_generic,
-        .addrspace_is_generic = type_function.data.flags.addrspace_is_generic,
         .is_generic = type_function.data.flags.is_generic,
     };
 }
@@ -8470,9 +8520,6 @@ pub fn getFuncType(
             .has_noalias_bits = key.noalias_bits != 0,
             .is_generic = key.is_generic,
             .is_noinline = key.is_noinline,
-            .cc_is_generic = key.cc == null,
-            .section_is_generic = key.section_is_generic,
-            .addrspace_is_generic = key.addrspace_is_generic,
         },
     });
 
@@ -8644,10 +8691,6 @@ pub const GetFuncDeclIesKey = struct {
     bare_return_type: Index,
     /// null means generic.
     cc: ?std.builtin.CallingConvention,
-    /// null means generic.
-    alignment: ?Alignment,
-    section_is_generic: bool,
-    addrspace_is_generic: bool,
     is_var_args: bool,
     is_generic: bool,
     is_noinline: bool,
@@ -8733,9 +8776,6 @@ pub fn getFuncDeclIes(
             .has_noalias_bits = key.noalias_bits != 0,
             .is_generic = key.is_generic,
             .is_noinline = key.is_noinline,
-            .cc_is_generic = key.cc == null,
-            .section_is_generic = key.section_is_generic,
-            .addrspace_is_generic = key.addrspace_is_generic,
         },
     });
     if (key.comptime_bits != 0) extra.appendAssumeCapacity(.{key.comptime_bits});
@@ -8867,9 +8907,6 @@ pub const GetFuncInstanceKey = struct {
     comptime_args: []const Index,
     noalias_bits: u32,
     bare_return_type: Index,
-    cc: std.builtin.CallingConvention,
-    alignment: Alignment,
-    section: OptionalNullTerminatedString,
     is_noinline: bool,
     generic_owner: Index,
     inferred_error_set: bool,
@@ -8884,11 +8921,14 @@ pub fn getFuncInstance(
     if (arg.inferred_error_set)
         return getFuncInstanceIes(ip, gpa, tid, arg);
 
+    const generic_owner = unwrapCoercedFunc(ip, arg.generic_owner);
+    const generic_owner_ty = ip.indexToKey(ip.funcDeclInfo(generic_owner).ty).func_type;
+
     const func_ty = try ip.getFuncType(gpa, tid, .{
         .param_types = arg.param_types,
         .return_type = arg.bare_return_type,
         .noalias_bits = arg.noalias_bits,
-        .cc = arg.cc,
+        .cc = generic_owner_ty.cc,
         .is_noinline = arg.is_noinline,
     });
 
@@ -8897,8 +8937,6 @@ pub fn getFuncInstance(
     const extra = local.getMutableExtra(gpa);
     try extra.ensureUnusedCapacity(@typeInfo(Tag.FuncInstance).@"struct".fields.len +
         arg.comptime_args.len);
-
-    const generic_owner = unwrapCoercedFunc(ip, arg.generic_owner);
 
     assert(arg.comptime_args.len == ip.funcTypeParamsLen(ip.typeOf(generic_owner)));
 
@@ -8946,8 +8984,6 @@ pub fn getFuncInstance(
         generic_owner,
         func_index,
         func_extra_index,
-        arg.alignment,
-        arg.section,
     );
     return gop.put();
 }
@@ -8972,6 +9008,7 @@ pub fn getFuncInstanceIes(
     try items.ensureUnusedCapacity(4);
 
     const generic_owner = unwrapCoercedFunc(ip, arg.generic_owner);
+    const generic_owner_ty = ip.indexToKey(ip.funcDeclInfo(arg.generic_owner).ty).func_type;
 
     // The strategy here is to add the function decl unconditionally, then to
     // ask if it already exists, and if so, revert the lengths of the mutated
@@ -9027,15 +9064,12 @@ pub fn getFuncInstanceIes(
         .params_len = params_len,
         .return_type = error_union_type,
         .flags = .{
-            .cc = .pack(arg.cc),
+            .cc = .pack(generic_owner_ty.cc),
             .is_var_args = false,
             .has_comptime_bits = false,
             .has_noalias_bits = arg.noalias_bits != 0,
             .is_generic = false,
             .is_noinline = arg.is_noinline,
-            .cc_is_generic = false,
-            .section_is_generic = false,
-            .addrspace_is_generic = false,
         },
     });
     // no comptime_bits because has_comptime_bits is false
@@ -9099,8 +9133,6 @@ pub fn getFuncInstanceIes(
         generic_owner,
         func_index,
         func_extra_index,
-        arg.alignment,
-        arg.section,
     );
 
     func_gop.putFinal(func_index);
@@ -9118,8 +9150,6 @@ fn finishFuncInstance(
     generic_owner: Index,
     func_index: Index,
     func_extra_index: u32,
-    alignment: Alignment,
-    section: OptionalNullTerminatedString,
 ) Allocator.Error!void {
     const fn_owner_nav = ip.getNav(ip.funcDeclInfo(generic_owner).owner_nav);
     const fn_namespace = ip.getCau(fn_owner_nav.analysis_owner.unwrap().?).namespace;
@@ -9132,8 +9162,8 @@ fn finishFuncInstance(
         .name = nav_name,
         .fqn = try ip.namespacePtr(fn_namespace).internFullyQualifiedName(ip, gpa, tid, nav_name),
         .val = func_index,
-        .alignment = alignment,
-        .@"linksection" = section,
+        .alignment = fn_owner_nav.status.resolved.alignment,
+        .@"linksection" = fn_owner_nav.status.resolved.@"linksection",
         .@"addrspace" = fn_owner_nav.status.resolved.@"addrspace",
     });
 
@@ -9719,7 +9749,6 @@ fn addExtraAssumeCapacity(extra: Local.Extra.Mutable, item: anytype) u32 {
             OptionalNamespaceIndex,
             MapIndex,
             OptionalMapIndex,
-            RuntimeIndex,
             String,
             NullTerminatedString,
             OptionalNullTerminatedString,
@@ -9783,7 +9812,6 @@ fn extraDataTrail(extra: Local.Extra, comptime T: type, index: u32) struct { dat
             OptionalNamespaceIndex,
             MapIndex,
             OptionalMapIndex,
-            RuntimeIndex,
             String,
             NullTerminatedString,
             OptionalNullTerminatedString,
